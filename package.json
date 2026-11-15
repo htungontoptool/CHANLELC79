@@ -1,0 +1,24 @@
+{
+  "name": "chanle-api-ai",
+  "version": "1.0.0",
+  "description": "API du doan chan le AI",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "keywords": [
+    "api",
+    "express",
+    "ai",
+    "chanle"
+  ],
+  "author": "HuyDaiXu",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.2",
+    "cors": "^2.8.5",
+    "express": "^4.19.2"
+  }
+}
