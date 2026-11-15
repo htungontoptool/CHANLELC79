@@ -244,8 +244,17 @@ function markovChron(results, k) {
 }
 
 // Vị = số xúc xắc đỏ theo màu chiếm đa số trong 4 xúc xắc
-const VI_LABELS = { four_do: '4 ĐỎ', four_trang: '4 TRẮNG', three_do: '3 ĐỎ', three_trang: '3 TRẮNG', two_do: '2-2', two_trang: '2-2' };
-const VI_PRIOR = { '4 ĐỎ': 1 / 16, '4 TRẮNG': 1 / 16, '3 ĐỎ': 4 / 16, '3 TRẮNG': 4 / 16, '2-2': 6 / 16 };
+const VI_LABELS = {
+    four_do: '4 ĐỎ', three_do: '3 ĐỎ 1 TRẮNG', two_do: '2 ĐỎ 2 TRẮNG', two_trang: '2 ĐỎ 2 TRẮNG',
+    three_trang: '1 ĐỎ 3 TRẮNG', four_trang: '4 TRẮNG'
+};
+// Số đỏ, số trắng ứng với từng vị
+const VI_COUNTS = {
+    '4 ĐỎ': [4, 0], '3 ĐỎ 1 TRẮNG': [3, 1], '2 ĐỎ 2 TRẮNG': [2, 2], '1 ĐỎ 3 TRẮNG': [1, 3], '4 TRẮNG': [0, 4]
+};
+const VI_PRIOR = {
+    '4 ĐỎ': 1 / 16, '3 ĐỎ 1 TRẮNG': 4 / 16, '2 ĐỎ 2 TRẮNG': 6 / 16, '1 ĐỎ 3 TRẮNG': 4 / 16, '4 TRẮNG': 1 / 16
+};
 
 function viLabel(resultVi) { return VI_LABELS[resultVi] || null; }
 
@@ -279,23 +288,27 @@ function saveHistory() {
     catch (e) { console.log(`Không lưu được lịch sử: ${e.message}`); }
 }
 
+function resultText(chanLe, vi) {
+    const cl = chanLe === 'chan' ? 'CHẴN' : 'LẺ';
+    const c = vi && VI_COUNTS[vi];
+    if (!c) return cl;
+    return `${cl} - ${c[1]} TRẮNG + ${c[0]} ĐỎ`;
+}
+
 function resolvePredictions(newData) {
     let changed = false;
     for (const s of newData) {
         const p = pendingPred.get(s.id);
         if (!p) continue;
         const actualVi = viLabel(s.resultVi);
-        const dices = s.dices || [];
         history.unshift({
             Phien: s.id,
-            Du_doan_chan_le: p.chan_le === 'chan' ? 'CHAN' : 'LE',
-            Ket_qua_chan_le: s.resultTruyenThong === 'chan' ? 'CHAN' : 'LE',
+            Du_doan_chan_le: p.chan_le === 'chan' ? 'CHẴN' : 'LẺ',
+            Ket_qua: resultText(s.resultTruyenThong, actualVi),
             Dung_chan_le: p.chan_le === s.resultTruyenThong,
             Du_doan_vi: p.vi,
             Ket_qua_vi: actualVi,
-            Dung_vi: p.vi === actualVi,
-            Xuc_xac: dices.map(d => d === 'do' ? 'DO' : 'TRANG'),
-            So_do: dices.filter(d => d === 'do').length
+            Dung_vi: p.vi === actualVi
         });
         pendingPred.delete(s.id);
         changed = true;
@@ -313,16 +326,20 @@ function resolvePredictions(newData) {
 
 function historyStats() {
     const n = history.length;
-    const pct = (a, b) => b ? (a / b * 100).toFixed(1) + '%' : '0%';
+    const pct = (a, b) => b ? (a / b * 100).toFixed(0) + '%' : '0%';
     const cl = history.filter(h => h.Dung_chan_le).length;
     const vi = history.filter(h => h.Dung_vi).length;
     return {
-        Tong_du_doan: n,
-        Chan_le_dung: cl,
-        Chan_le_ti_le: pct(cl, n),
-        Vi_dung: vi,
-        Vi_ti_le: pct(vi, n)
+        'Tổng': n,
+        'Chẵn/Lẻ': `✅ ${cl}/${n} · ${pct(cl, n)}`,
+        'Vị': `✅ ${vi}/${n} · ${pct(vi, n)}`
     };
+}
+
+// Mỗi phiên một dòng gọn: phiên │ dự đoán ✅/❌ │ dự vị ✅/❌ │ kết quả
+function historyLine(h) {
+    const mark = ok => ok ? '✅' : '❌';
+    return `${h.Phien} │ ${h.Du_doan_chan_le} ${mark(h.Dung_chan_le)} │ ${h.Du_doan_vi} ${mark(h.Dung_vi)} │ ${h.Ket_qua}`;
 }
 
 function buildCard(id, p) {
@@ -330,25 +347,20 @@ function buildCard(id, p) {
         id: BRAND_ID,
         Name: BRAND_NAME,
         Phien: id,
-        Xuc_xac_1: null,
-        Xuc_xac_2: null,
-        Xuc_xac_3: null,
-        Xuc_xac_4: null,
-        Tong: null,
-        Ket_qua: p.chan_le === 'chan' ? 'CHAN' : 'LE',
-        Vi: p.vi
+        'DỰ ĐOÁN': p.chan_le === 'chan' ? 'CHẴN' : 'LẺ',
+        'DỰ VỊ': p.vi
     };
 }
 
 app.get('/api/xdlc', async (req, res) => {
     try {
         if (latestSessions.length === 0) await fetchLatestData();
-        if (latestSessions.length === 0) return res.json({ id: BRAND_ID, Name: BRAND_NAME, Phien: null, Ket_qua: null, Vi: null });
+        if (latestSessions.length === 0) return res.json({ id: BRAND_ID, Name: BRAND_NAME, Phien: null, 'DỰ ĐOÁN': null, 'DỰ VỊ': null });
         const nextId = latestSessions[0].id + 1;
         if (!pendingPred.has(nextId)) await refreshPrediction();
         res.json(buildCard(nextId, pendingPred.get(nextId)));
     } catch (error) {
-        res.json({ id: BRAND_ID, Name: BRAND_NAME, Phien: null, Ket_qua: null, Vi: null });
+        res.json({ id: BRAND_ID, Name: BRAND_NAME, Phien: null, 'DỰ ĐOÁN': null, 'DỰ VỊ': null });
     }
 });
 
@@ -357,8 +369,8 @@ function historyResponse(req, res) {
     res.json({
         id: BRAND_ID,
         Name: BRAND_NAME,
-        Thong_ke: historyStats(),
-        Lich_su: history.slice(0, n)
+        'Thống kê': historyStats(),
+        'Lịch sử': history.slice(0, n).map(historyLine)
     });
 }
 app.get('/history', historyResponse);
