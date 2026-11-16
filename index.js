@@ -258,17 +258,49 @@ const VI_PRIOR = {
 
 function viLabel(resultVi) { return VI_LABELS[resultVi] || null; }
 
-// Dự đoán vị: tần suất 200 phiên gần nhất, làm mượt bằng xác suất lý thuyết (4 xúc xắc công bằng)
+// Dự đoán vị.
+// VI_MODE=best (mặc định cũ): luôn chọn vị có xác suất cao nhất -> lặp lại "2 ĐỎ 2 TRẮNG".
+// VI_MODE=thompson (mặc định mới): lấy mẫu từ phân phối hậu nghiệm Dirichlet của tần suất
+// 200 phiên gần nhất -> vị đa dạng hơn, vẫn ưu tiên vị hay xuất hiện.
+const VI_MODE = process.env.VI_MODE || 'thompson';
+
+function randn() {
+    const u = 1 - Math.random(), v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// Gamma(shape >= 1), thuật toán Marsaglia-Tsang
+function gammaSample(shape) {
+    const d = shape - 1 / 3, c = 1 / Math.sqrt(9 * d);
+    while (true) {
+        let x, v;
+        do { x = randn(); v = 1 + c * x; } while (v <= 0);
+        v = v * v * v;
+        const u = Math.random();
+        if (u < 1 - 0.0331 * x * x * x * x) return d * v;
+        if (Math.log(u) < 0.5 * x * x + d * (1 - v + Math.log(v))) return d * v;
+    }
+}
+
 function predictVi(sessions) {
     const recent = sessions.slice(0, 200);
     const counts = {};
     Object.keys(VI_PRIOR).forEach(l => counts[l] = 0);
     recent.forEach(s => { const l = viLabel(s.resultVi); if (l) counts[l]++; });
     const pseudo = 20;
-    let best = null, bestScore = -1;
-    for (const l of Object.keys(VI_PRIOR)) {
-        const score = (counts[l] + pseudo * VI_PRIOR[l]) / (recent.length + pseudo);
-        if (score > bestScore) { bestScore = score; best = l; }
+    const labels = Object.keys(VI_PRIOR);
+    if (VI_MODE === 'best') {
+        let best = null, bestScore = -1;
+        for (const l of labels) {
+            const score = (counts[l] + pseudo * VI_PRIOR[l]) / (recent.length + pseudo);
+            if (score > bestScore) { bestScore = score; best = l; }
+        }
+        return best;
+    }
+    let best = null, bestDraw = -1;
+    for (const l of labels) {
+        const draw = gammaSample(counts[l] + pseudo * VI_PRIOR[l]);
+        if (draw > bestDraw) { bestDraw = draw; best = l; }
     }
     return best;
 }
