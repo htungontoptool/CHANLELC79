@@ -282,27 +282,61 @@ function gammaSample(shape) {
     }
 }
 
-function predictVi(sessions) {
+// Kiểm định phân bố vị thực tế so với lý thuyết (chi-bình phương, 4 bậc tự do)
+function chi2Sf4(x) { return Math.exp(-x / 2) * (1 + x / 2); }
+
+function viOutcomeStats(sessions) {
     const recent = sessions.slice(0, 200);
     const counts = {};
     Object.keys(VI_PRIOR).forEach(l => counts[l] = 0);
-    recent.forEach(s => { const l = viLabel(s.resultVi); if (l) counts[l]++; });
+    let n = 0;
+    recent.forEach(s => { const l = viLabel(s.resultVi); if (l) { counts[l]++; n++; } });
+    let stat = 0;
+    for (const l of Object.keys(VI_PRIOR)) {
+        const e = n * VI_PRIOR[l];
+        if (e > 0) stat += (counts[l] - e) ** 2 / e;
+    }
+    return { n, counts, p: n >= 30 ? chi2Sf4(stat) : null };
+}
+
+// Chỉ dùng tần suất thực tế khi lệch có ý nghĩa (p < 0.05); nếu không thì dùng xác suất lý thuyết.
+// Như vậy không đuổi theo nhiễu ngẫu nhiên.
+function predictVi(sessions) {
+    const st = viOutcomeStats(sessions);
     const pseudo = 20;
     const labels = Object.keys(VI_PRIOR);
+    const deviates = st.p !== null && st.p < 0.05;
     if (VI_MODE === 'best') {
         let best = null, bestScore = -1;
         for (const l of labels) {
-            const score = (counts[l] + pseudo * VI_PRIOR[l]) / (recent.length + pseudo);
+            const base = deviates ? st.counts[l] : st.n * VI_PRIOR[l];
+            const score = (base + pseudo * VI_PRIOR[l]) / (st.n + pseudo);
             if (score > bestScore) { bestScore = score; best = l; }
         }
         return best;
     }
     let best = null, bestDraw = -1;
     for (const l of labels) {
-        const draw = gammaSample(counts[l] + pseudo * VI_PRIOR[l]);
+        const base = deviates ? st.counts[l] : st.n * VI_PRIOR[l];
+        const draw = gammaSample(base + pseudo * VI_PRIOR[l]);
         if (draw > bestDraw) { bestDraw = draw; best = l; }
     }
     return best;
+}
+
+// Chẵn/lẻ: với 4 xúc xắc công bằng, xác suất chẵn = lẻ = 50%, nên mọi lựa chọn đều có kỳ vọng như nhau.
+// CL_MODE=fair (mặc định): nếu chẵn/lẻ không lệch có ý nghĩa thì chọn ngẫu nhiên 50/50 -> hết tình trạng lặp một phía;
+//   nếu lệch có ý nghĩa (p < 0.05) thì theo phía đang nhiều hơn.
+// CL_MODE=algo: dùng kết quả của ultimatePrediction (79 thuật toán) như cũ.
+const CL_MODE = process.env.CL_MODE || 'fair';
+
+function chooseChanLe(sessions, algoPick) {
+    if (CL_MODE === 'algo') return algoPick;
+    const recent = sessions.slice(0, 200).map(s => s.resultTruyenThong).filter(x => x === 'chan' || x === 'le');
+    const n = recent.length;
+    const k = recent.filter(x => x === 'chan').length;
+    if (n >= 30 && binomTwoSidedP(k, n, 0.5) < 0.05) return k / n > 0.5 ? 'chan' : 'le';
+    return Math.random() < 0.5 ? 'chan' : 'le';
 }
 
 async function refreshPrediction() {
@@ -311,7 +345,7 @@ async function refreshPrediction() {
     if (pendingPred.has(nextId)) return;
     const cl = await ultimatePrediction(latestSessions);
     if (!pendingPred.has(nextId)) {
-        pendingPred.set(nextId, { chan_le: cl.prediction, vi: predictVi(latestSessions) });
+        pendingPred.set(nextId, { chan_le: chooseChanLe(latestSessions, cl.prediction), vi: predictVi(latestSessions) });
     }
 }
 
@@ -379,6 +413,22 @@ function verdict(k, n, p0) {
     return 'chưa khác ngẫu nhiên';
 }
 
+// Tỷ lệ từng vị trong các kết quả đã về, so với lý thuyết
+function viDistribution() {
+    const labels = Object.keys(VI_PRIOR);
+    const counts = {};
+    labels.forEach(l => counts[l] = 0);
+    let n = 0;
+    history.forEach(h => { if (counts[h.Ket_qua_vi] !== undefined) { counts[h.Ket_qua_vi]++; n++; } });
+    if (n === 0) return 'chưa có dữ liệu';
+    let stat = 0;
+    labels.forEach(l => { const e = n * VI_PRIOR[l]; stat += (counts[l] - e) ** 2 / e; });
+    const p = n >= 30 ? chi2Sf4(stat).toFixed(3) : null;
+    const parts = labels.map(l => `${l} ${(counts[l] / n * 100).toFixed(0)}% (lt ${(VI_PRIOR[l] * 100).toFixed(0)}%)`);
+    const verdictTxt = p === null ? 'chưa đủ mẫu' : (p < 0.05 ? `⚠️ lệch lý thuyết (p=${p})` : `✅ khớp lý thuyết (p=${p})`);
+    return `${parts.join(' · ')} · ${verdictTxt}`;
+}
+
 function historyStats() {
     const n = history.length;
     const pct = (a, b) => b ? (a / b * 100).toFixed(0) + '%' : '0%';
@@ -387,7 +437,8 @@ function historyStats() {
     return {
         'Tổng': n,
         'Chẵn/Lẻ': `✅ ${cl}/${n} · ${pct(cl, n)} · ${verdict(cl, n, 0.5)}`,
-        'Vị': `✅ ${vi}/${n} · ${pct(vi, n)} · ${verdict(vi, n, 6 / 16)}`
+        'Vị': `✅ ${vi}/${n} · ${pct(vi, n)} · ${verdict(vi, n, 6 / 16)}`,
+        'Phân bố vị thực tế': viDistribution()
     };
 }
 
