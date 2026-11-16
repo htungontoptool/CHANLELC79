@@ -356,6 +356,29 @@ function resolvePredictions(newData) {
     }
 }
 
+// Xác suất nhị thức hai phía: P(X có độ bất thường >= quan sát) khi tỷ lệ lý thuyết là p0
+const LOG_FACT = [0];
+for (let i = 1; i <= 1000; i++) LOG_FACT[i] = LOG_FACT[i - 1] + Math.log(i);
+function binomTwoSidedP(k, n, p0) {
+    if (n === 0) return 1;
+    const logPmf = x => LOG_FACT[n] - LOG_FACT[x] - LOG_FACT[n - x] + x * Math.log(p0) + (n - x) * Math.log(1 - p0);
+    const pObs = Math.exp(logPmf(k));
+    let total = 0;
+    for (let x = 0; x <= n; x++) {
+        const px = Math.exp(logPmf(x));
+        if (px <= pObs * (1 + 1e-9)) total += px;
+    }
+    return Math.min(1, total);
+}
+
+// Đánh giá: đúng hơn ngẫu nhiên không? Chẵn/Lẻ so với 50%, Vị so với 6/16 (cơ cấu 2-2 có xác suất cao nhất)
+function verdict(k, n, p0) {
+    if (n < 30) return 'chưa đủ mẫu';
+    const p = binomTwoSidedP(k, n, p0);
+    if (p < 0.05) return k / n > p0 ? 'tốt hơn ngẫu nhiên' : 'kém ngẫu nhiên';
+    return 'chưa khác ngẫu nhiên';
+}
+
 function historyStats() {
     const n = history.length;
     const pct = (a, b) => b ? (a / b * 100).toFixed(0) + '%' : '0%';
@@ -363,8 +386,8 @@ function historyStats() {
     const vi = history.filter(h => h.Dung_vi).length;
     return {
         'Tổng': n,
-        'Chẵn/Lẻ': `✅ ${cl}/${n} · ${pct(cl, n)}`,
-        'Vị': `✅ ${vi}/${n} · ${pct(vi, n)}`
+        'Chẵn/Lẻ': `✅ ${cl}/${n} · ${pct(cl, n)} · ${verdict(cl, n, 0.5)}`,
+        'Vị': `✅ ${vi}/${n} · ${pct(vi, n)} · ${verdict(vi, n, 6 / 16)}`
     };
 }
 
@@ -374,13 +397,22 @@ function historyLine(h) {
     return `${h.Phien} │ ${h.Du_doan_chan_le} ${mark(h.Dung_chan_le)} │ ${h.Du_doan_vi} ${mark(h.Dung_vi)} │ ${h.Ket_qua}`;
 }
 
+// Phiên trước: đã đoán gì và đúng hay sai (ngắn gọn)
+function previousResult() {
+    const h = history[0];
+    if (!h) return 'chưa có';
+    const mark = ok => ok ? '✅' : '❌';
+    return `${h.Phien} · ${h.Du_doan_chan_le} ${mark(h.Dung_chan_le)} · ${h.Du_doan_vi} ${mark(h.Dung_vi)}`;
+}
+
 function buildCard(id, p) {
     return {
         id: BRAND_ID,
         Name: BRAND_NAME,
         Phien: id,
         'DỰ ĐOÁN': p.chan_le === 'chan' ? 'CHẴN' : 'LẺ',
-        'DỰ VỊ': p.vi
+        'DỰ VỊ': p.vi,
+        'PHIÊN TRƯỚC': previousResult()
     };
 }
 
