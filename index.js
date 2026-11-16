@@ -6,7 +6,7 @@ const app = express();
 const PORT = process.env.PORT || 9000;
 const LC_AT = process.env.LC_AT || 'bc1qgk07vhn53ws7khy3840gjjvlw7qgzftfjgweq2';
 const BRAND_ID = '@htungdzvipmax';
-const BRAND_NAME = 'LC79-CHAN+LE+VI';
+const BRAND_NAME = 'LC79';
 const HISTORY_MAX = 500;
 const HISTORY_SHOW = 50;
 const DATA_DIR = process.env.DATA_DIR || '.';
@@ -492,6 +492,131 @@ app.get('/history', historyResponse);
 app.get('/api/history', historyResponse);
 
 app.get('/api/health', (req, res) => { res.json({ status: 'ok', algorithms: 79, updates: updateCount }); });
+
+// ========== TÀI XỈU (MD5 và THƯỜNG): không có vị, có xúc xắc, lịch sử và file riêng ==========
+// Mỗi bàn có state, file lịch sử và route riêng, không trộn với xóc đĩa.
+const TX_AT = process.env.TX_AT || '';
+const TX_WARMUP = 5;          // nạp hết phiên lúc khởi động, sau 5 phiên mới bắt đầu dự đoán
+
+function txFairPick(results) {
+    // Không có lợi thế thống kê: nếu lịch sử không lệch có ý nghĩa thì chọn 50/50.
+    const recent = results.slice(0, 200);
+    const n = recent.length;
+    const k = recent.filter(x => x === 'TAI').length;
+    if (n >= 30 && binomTwoSidedP(k, n, 0.5) < 0.05) return k / n > 0.5 ? 'TAI' : 'XIU';
+    return Math.random() < 0.5 ? 'TAI' : 'XIU';
+}
+
+function makeTxGame(cfg) {
+    const file = require('path').join(DATA_DIR, cfg.file);
+    let history = [];
+    try { history = JSON.parse(require('fs').readFileSync(file, 'utf8')); } catch (e) { history = []; }
+    const st = { latest: [], pending: new Map(), bootId: null, seenNew: 0 };
+    const saveHist = () => { try { require('fs').writeFileSync(file, JSON.stringify(history)); } catch (e) { console.log(`[${cfg.name}] không lưu được lịch sử: ${e.message}`); } };
+
+    async function fetchList() {
+        const r = await axios.get(cfg.url(), { headers: { 'User-Agent': 'Mozilla/5.0', Origin: 'https://lc79.to' }, timeout: 10000 });
+        const data = r.data;
+        if (!data || !Array.isArray(data.list)) return [];
+        return data.list
+            .filter(x => x.resultTruyenThong === 'TAI' || x.resultTruyenThong === 'XIU')
+            .map(x => ({
+                id: x.id,
+                result: x.resultTruyenThong,
+                dices: x.dices || [],
+                point: x.point ?? (x.dices || []).reduce((a, b) => a + b, 0)
+            }))
+            .sort((a, b) => a.id - b.id);
+    }
+
+    function ensureNext() {
+        if (!st.latest.length) return;
+        const nextId = st.latest[0].id + 1;
+        if (st.seenNew >= TX_WARMUP && !st.pending.has(nextId)) {
+            st.pending.set(nextId, { du_doan: txFairPick(st.latest.map(s => s.result)) });
+        }
+    }
+
+    async function refresh() {
+        const arr = await fetchList();
+        if (!arr.length) return;
+        const newest = arr[arr.length - 1];
+        if (st.bootId === null) st.bootId = newest.id;           // mốc khởi động
+        st.latest = arr.slice().reverse();                        // mới nhất đứng đầu
+        st.seenNew = arr.filter(s => s.id > st.bootId).length;
+        let changed = false;
+        for (const s of arr) {
+            const p = st.pending.get(s.id);
+            if (!p) continue;
+            history.unshift({
+                Phien: s.id,
+                Du_doan: p.du_doan,
+                Ket_qua: s.result,
+                Tong: s.point,
+                Xuc_xac: s.dices,
+                Dung: p.du_doan === s.result
+            });
+            st.pending.delete(s.id);
+            changed = true;
+        }
+        for (const id of st.pending.keys()) if (id < newest.id) st.pending.delete(id);
+        if (changed) { history = history.slice(0, 500); saveHist(); }
+        ensureNext();
+    }
+
+    const mark = ok => ok ? '✅' : '❌';
+    const label = r => r === 'TAI' ? 'TÀI' : 'XỈU';
+
+    app.get(cfg.route, async (req, res) => {
+        const base = { id: BRAND_ID, Name: cfg.name };
+        try {
+            if (!st.latest.length) await refresh();
+            if (!st.latest.length) return res.json({ ...base, Phien: null, 'TRẠNG THÁI': 'chưa nạp được dữ liệu' });
+            ensureNext();
+            const nextId = st.latest[0].id + 1;
+            const p = st.pending.get(nextId);
+            if (!p) return res.json({ ...base, Phien: null, 'TRẠNG THÁI': `đang nạp, còn ${Math.max(0, TX_WARMUP - st.seenNew)} phiên` });
+            res.json({ ...base, Phien: nextId, 'DỰ ĐOÁN': label(p.du_doan) });
+        } catch (e) {
+            res.json({ ...base, Phien: null, 'TRẠNG THÁI': 'lỗi tạm thời' });
+        }
+    });
+
+    app.get(cfg.historyRoute, (req, res) => {
+        const n = Math.min(50, parseInt(req.query.n, 10) || 50);
+        const total = history.length;
+        const hit = history.filter(h => h.Dung).length;
+        res.json({
+            id: BRAND_ID,
+            Name: cfg.name,
+            'Thống kê': {
+                'Tổng': total,
+                'Đúng': `✅ ${hit}/${total}`,
+                'Đánh giá': verdict(hit, total, 0.5)
+            },
+            'Lịch sử': history.slice(0, n).map(h => `${h.Phien} │ ${label(h.Du_doan)} ${mark(h.Dung)} │ ${label(h.Ket_qua)} (${h.Tong})`)
+        });
+    });
+
+    refresh().catch(() => {});
+    setInterval(() => refresh().catch(() => {}), 2000);
+}
+
+makeTxGame({
+    name: 'TÀI XỈU MD5',
+    url: () => 'https://wtxmd52.tele68.com/v1/txmd5/sessions',
+    route: '/api/md5',
+    historyRoute: '/history/md5',
+    file: 'history_md5.json'
+});
+
+makeTxGame({
+    name: 'TÀI XỈU THƯỜNG',
+    url: () => `https://wtx.tele68.com/v1/tx/lite-sessions?cp=R&cl=R&pf=web&at=${TX_AT}`,
+    route: '/api/tx',
+    historyRoute: '/history/tx',
+    file: 'history_tx.json'
+});
 
 app.listen(PORT, () => {
     console.log('\n╔══════════════════════════════════════════════════════════════════╗');
