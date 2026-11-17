@@ -21,6 +21,95 @@ try { history = JSON.parse(require('fs').readFileSync(HISTORY_FILE, 'utf8')); } 
 app.use(cors());
 app.use(express.json());
 
+// ========== KEY SYSTEM (đặt sớm để middleware chạy trước mọi route) ==========
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const KEY_FILE = path.join(DATA_DIR, 'keys.json');
+let keys = [];
+try { keys = JSON.parse(fs.readFileSync(KEY_FILE, 'utf8')); } catch (e) { keys = []; }
+const saveKeys = () => fs.writeFileSync(KEY_FILE, JSON.stringify(keys, null, 2));
+// Key 6 ký tự: chỉ chữ thường + số
+const makeKey = () => {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let s = '';
+    const bytes = crypto.randomBytes(6);
+    for (let i = 0; i < 6; i++) s += chars[bytes[i] % chars.length];
+    return s;
+};
+const durationMs = (v) => {
+    const m = String(v || '1d').match(/^(\d+)(h|d|w)$/i);
+    if (!m) return 86400000;
+    return Number(m[1]) * ({ h: 3600000, d: 86400000, w: 604800000 }[m[2].toLowerCase()]);
+};
+function keyInfo(k) {
+    if (!k) return null;
+    const lower = String(k).toLowerCase();
+    return keys.find(x => x.key === lower && x.active && Date.now() < x.expiresAt);
+}
+const apiNames = [
+    '/api/xdlc', '/history', '/api/history',
+    '/api/tx', '/history/tx',
+    '/api/md5', '/history/md5',
+    '/api/hitclub/tx', '/history/hitclub/tx',
+    '/api/hitclub/md5', '/history/hitclub/md5',
+    '/api/max789/tx', '/history/max789/tx',
+    '/api/max789/md5', '/history/max789/md5',
+    '/api/health'
+];
+
+// Middleware: bắt buộc có key hợp lệ. Không key → không có quyền truy cập
+app.use((req, res, next) => {
+    const parts = req.path.split('/').filter(Boolean);
+    // Bỏ qua root và favicon
+    if (parts.length === 0 || parts[0] === 'favicon.ico') return next();
+
+    // Có key 6 ký tự ở đầu URL
+    if (parts.length >= 1 && /^[a-z0-9]{6}$/i.test(parts[0])) {
+        const possibleKey = parts[0].toLowerCase();
+        const k = keyInfo(possibleKey);
+        if (!k) return res.status(403).json({ error: 'KEY_INVALID_OR_EXPIRED', message: 'Key không hợp lệ hoặc đã hết hạn' });
+
+        // Chỉ /{key} → để route list API xử lý
+        if (parts.length === 1) {
+            req.accessKey = possibleKey;
+            return next();
+        }
+
+        // /{key}/api/... → rewrite
+        const target = '/' + parts.slice(1).join('/');
+        if (!apiNames.includes(target)) {
+            return res.status(404).json({ error: 'API_NOT_FOUND', path: target });
+        }
+        const qs = req.url.includes('?') ? '?' + req.url.split('?').slice(1).join('?') : '';
+        req.url = target + qs;
+        if (req._parsedUrl) delete req._parsedUrl;
+        req.accessKey = possibleKey;
+        return next();
+    }
+
+    // Không có key → chặn tất cả API
+    const barePath = '/' + parts.join('/');
+    if (apiNames.includes(barePath) || parts[0] === 'api' || parts[0] === 'history') {
+        return res.status(403).json({ error: 'NO_PERMISSION', message: 'Không có quyền truy cập. Vui lòng dùng key hợp lệ.' });
+    }
+    next();
+});
+
+// GET /{key} → danh sách API
+app.get('/:accessKey', (req, res, next) => {
+    if (!/^[a-z0-9]{6}$/i.test(req.params.accessKey)) return next();
+    const k = keyInfo(req.params.accessKey);
+    if (!k) return res.status(403).json({ error: 'KEY_INVALID_OR_EXPIRED' });
+    res.json({
+        status: 'active',
+        key: k.key,
+        expiresAt: new Date(k.expiresAt).toISOString(),
+        apis: apiNames.filter(p => p !== '/api/health').map(p => `/${k.key}${p}`)
+    });
+});
+
 let latestSessions = [];
 let lastUpdateTime = null;
 let updateCount = 0;
@@ -494,9 +583,6 @@ app.get('/api/history', historyResponse);
 app.get('/api/health', (req, res) => { res.json({ status: 'ok', algorithms: 79, updates: updateCount }); });
 
 // ========== TÀI XỈU LC79 / HITCLUB / MAX789 ==========
-const fs = require('fs');
-const path = require('path');
-fs.mkdirSync(DATA_DIR, { recursive: true });
 const gameStates = {};
 
 function firstArray(payload) {
@@ -762,46 +848,8 @@ makeTxGame({key:'hitclub-md5',name:'HITCLUB-TX MD5',url:'https://apihitclubhihi.
 makeTxGame({key:'max789-tx',name:'MAX789-TX THƯỜNG',url:'https://taixiu.maksh3979madfw.com/api/luckydice/GetSoiCau',route:'/api/max789/tx',historyRoute:'/history/max789/tx',file:'history_max789_tx.json'});
 makeTxGame({key:'max789-md5',name:'MAX789-TX MD5',url:'https://taixiumd5.maksh3979madfw.com/api/md5luckydice/GetSoiCau',route:'/api/max789/md5',historyRoute:'/history/max789/md5',file:'history_max789_md5.json'});
 
-// ========== KEY API + TELEGRAM BOT ==========
-const KEY_FILE=path.join(DATA_DIR,'keys.json');
-let keys=[]; try{keys=JSON.parse(fs.readFileSync(KEY_FILE,'utf8'));}catch{}
-const saveKeys=()=>fs.writeFileSync(KEY_FILE,JSON.stringify(keys,null,2));
-const crypto=require('crypto');
-// Key 6 ký tự: chỉ chữ thường + số (dễ nhớ, không in hoa)
-const makeKey = () => {
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    let s = '';
-    const bytes = crypto.randomBytes(6);
-    for (let i = 0; i < 6; i++) s += chars[bytes[i] % chars.length];
-    return s;
-};
-const durationMs = (v) => {
-    const m = String(v || '1d').match(/^(\d+)(h|d|w)$/i);
-    if (!m) return 86400000;
-    return Number(m[1]) * ({ h: 3600000, d: 86400000, w: 604800000 }[m[2].toLowerCase()]);
-};
-function keyInfo(k) {
-    if (!k) return null;
-    const lower = String(k).toLowerCase();
-    return keys.find(x => x.key === lower && x.active && Date.now() < x.expiresAt);
-}
-const apiNames=['/api/xdlc','/history','/api/tx','/history/tx','/api/md5','/history/md5','/api/hitclub/tx','/history/hitclub/tx','/api/hitclub/md5','/history/hitclub/md5','/api/max789/tx','/history/max789/tx','/api/max789/md5','/history/max789/md5'];
-app.get('/:accessKey', (req,res,next)=>{
-    const k=keyInfo(req.params.accessKey); if(!k)return res.status(403).json({error:'KEY_INVALID_OR_EXPIRED'});
-    res.json({status:'active',expiresAt:new Date(k.expiresAt).toISOString(),apis:apiNames.map(p=>`/${k.key}${p}`)});
-});
-app.use('/:accessKey', (req,res,next)=>{
-    // Bỏ qua route /:accessKey đã xử lý ở trên; chỉ rewrite khi có endpoint phía sau key.
-    const raw=req.path.replace(/^\//,'');
-    if(!raw) return next();
-    const k=keyInfo(req.params.accessKey); if(!k)return res.status(403).json({error:'KEY_INVALID_OR_EXPIRED'});
-    const target='/'+raw.split('/').filter(Boolean).join('/');
-    if(!apiNames.includes(target))return res.status(404).json({error:'API_NOT_FOUND'});
-    req.url=target+(req.url.includes('?')?'?'+req.url.split('?').slice(1).join('?'):'');
-    next();
-});
-
-let bot=null;
+// ========== TELEGRAM BOT ==========
+let bot = null;
 if(process.env.TELEGRAM_BOT_TOKEN){
     const TelegramBot=require('node-telegram-bot-api'); bot=new TelegramBot(process.env.TELEGRAM_BOT_TOKEN,{polling:true});
     const admins=(process.env.ADMIN_IDS||'').split(',').map(x=>x.trim()).filter(Boolean);
