@@ -134,7 +134,12 @@ async function fetchLatestData() {
                 lastUpdateTime = new Date();
                 updateCount++;
                 resolvePredictions(newData);
-                refreshPrediction().catch(() => {});
+                // Lần đầu: chạy 30 phiên ngầm trước khi dự đoán thật
+                if (history.length < 30) {
+                    bootstrapChanLe().then(() => refreshPrediction().catch(() => {})).catch(() => {});
+                } else {
+                    refreshPrediction().catch(() => {});
+                }
                 console.log(`[${lastUpdateTime.toLocaleTimeString()}] ✅ Cập nhật - Phiên: ${newData[0]?.id}`);
             }
         }
@@ -479,6 +484,38 @@ function resolvePredictions(newData) {
     }
 }
 
+// Nạp 30 phiên ngầm cho Chẵn Lẻ trước khi dự đoán thật
+async function bootstrapChanLe() {
+    if (history.length >= 30 || latestSessions.length < 15) return;
+    const chrono = latestSessions.slice().reverse(); // cũ → mới
+    const filled = [];
+    const start = Math.max(10, chrono.length - 30);
+    for (let i = start; i < chrono.length; i++) {
+        const past = chrono.slice(0, i).reverse(); // newest first
+        if (past.length < 8) continue;
+        try {
+            const cl = await ultimatePrediction(past);
+            const predCl = chooseChanLe(past, cl.prediction);
+            const predVi = predictVi(past);
+            const actual = chrono[i];
+            const actualVi = viLabel(actual.resultVi);
+            filled.push({
+                Phien: actual.id,
+                Du_doan_chan_le: predCl === 'chan' ? 'CHẴN' : 'LẺ',
+                Ket_qua: resultText(actual.resultTruyenThong, actualVi),
+                Dung_chan_le: predCl === actual.resultTruyenThong,
+                Du_doan_vi: predVi,
+                Ket_qua_vi: actualVi,
+                Dung_vi: predVi === actualVi
+            });
+        } catch (e) { /* skip */ }
+    }
+    if (!filled.length) return;
+    history = filled.reverse().concat(history).slice(0, HISTORY_MAX);
+    saveHistory();
+    console.log(`[CL] ✅ Bootstrap ${filled.length} phiên ngầm`);
+}
+
 // Xác suất nhị thức hai phía: P(X có độ bất thường >= quan sát) khi tỷ lệ lý thuyết là p0
 const LOG_FACT = [0];
 for (let i = 1; i <= 1000; i++) LOG_FACT[i] = LOG_FACT[i - 1] + Math.log(i);
@@ -610,136 +647,134 @@ function normalizeTx(x) {
 // Không có thuật toán nào bảo đảm thắng; chỉ là tổ hợp tín hiệu lịch sử có kiểm định cuốn chiếu.
 function txForecast(rows) {
     const seq = rows.map(x => x.result).filter(Boolean);
-    if (!seq.length) return { side: 'TAI', confidence: 52, dice: [3, 4, 5], sum: 12 };
+    if (!seq.length) return { side: 'TAI', confidence: 70, dice: [3, 4, 5], sum: 12 };
 
-    // 1. Tần suất có trọng số (gần đây nặng hơn)
-    const counts = { TAI: 1.5, XIU: 1.5 };
-    const limit = Math.min(120, seq.length);
-    for (let i = 0; i < limit; i++) {
-        const w = Math.exp(-i / 18);
-        counts[seq[i]] += w;
-    }
-    let score = Math.log(counts.TAI / counts.XIU) * 0.28;
+    const last = seq[0];
+    const opp = last === 'TAI' ? 'XIU' : 'TAI';
 
-    // 2. Markov bậc 1→5 (ma trận chuyển trạng thái)
-    for (let order = 1; order <= 5; order++) {
-        if (seq.length <= order + 3) continue;
-        const key = seq.slice(0, order).join('|');
-        let a = 1.2, b = 1.2, n = 0;
-        for (let i = order; i < Math.min(seq.length, 180); i++) {
-            if (seq.slice(i - order, i).join('|') === key) {
-                n++;
-                seq[i] === 'TAI' ? a++ : b++;
-            }
-        }
-        if (n >= 2) {
-            const w = (0.62 / order) * Math.min(1.35, n / 5);
-            score += Math.log(a / b) * w;
-        }
-    }
-
-    // 3. Phân tích cầu + Anti-break hệ thống (dựa lịch sử bẻ cầu thực tế)
+    // --- Cầu hiện tại ---
     let streak = 1;
     for (let i = 1; i < seq.length; i++) {
-        if (seq[i] === seq[0]) streak++;
+        if (seq[i] === last) streak++;
         else break;
     }
-    const lastSide = seq[0];
-    let histBreak = 0, histCont = 0;
-    for (let i = 0; i < Math.min(seq.length - streak - 1, 110); i++) {
+
+    // --- Thống kê bẻ/tiếp cầu cùng độ dài trong lịch sử ---
+    let brk = 0, cont = 0;
+    for (let i = 0; i < Math.min(seq.length - 1, 150); i++) {
         let s = 1;
         for (let j = i + 1; j < seq.length; j++) {
             if (seq[j] === seq[i]) s++;
             else break;
         }
-        if (s === streak) {
-            const after = seq[i + s];
-            if (after && after !== seq[i]) histBreak++;
-            else if (after) histCont++;
+        if (s === streak && i + s < seq.length) {
+            if (seq[i + s] !== seq[i]) brk++;
+            else cont++;
         }
     }
-    const breakRate = (histBreak + histCont) > 0 ? histBreak / (histBreak + histCont) : 0.55;
+    const totalSt = brk + cont;
+    const breakRate = totalSt >= 3 ? brk / totalSt : (streak >= 3 ? 0.58 : 0.42);
+
+    // --- Vote từ nhiều tín hiệu (tránh kẹt 1 bên) ---
+    let votesTai = 0, votesXiu = 0;
+    const add = (side, w) => { if (side === 'TAI') votesTai += w; else votesXiu += w; };
+
+    // 1) Cầu / Anti-break (trọng số cao nhất)
     if (streak >= 5) {
-        score += (lastSide === 'TAI' ? -1 : 1) * (0.48 + breakRate * 0.38);
+        // cầu rất dài → ưu tiên bẻ
+        add(opp, 3.2 * breakRate + 0.8);
+        add(last, 1.0 * (1 - breakRate));
     } else if (streak === 4) {
-        score += (lastSide === 'TAI' ? -1 : 1) * (0.30 + breakRate * 0.28);
+        add(opp, 2.4 * breakRate + 0.5);
+        add(last, 1.2 * (1 - breakRate));
     } else if (streak === 3) {
-        score += (lastSide === 'TAI' ? -1 : 1) * (0.14 + breakRate * 0.16);
-    } else if (streak === 1) {
-        score += (lastSide === 'TAI' ? 0.18 : -0.18);
+        add(opp, 1.6 * breakRate);
+        add(last, 1.4 * (1 - breakRate) + 0.3);
+    } else if (streak === 2) {
+        // cầu 2 → thường tiếp
+        add(last, 1.8);
+        add(opp, 0.7);
+    } else {
+        // vừa đảo (streak 1) → ưu tiên giữ chiều mới
+        add(last, 2.0);
+        add(opp, 0.6);
     }
 
-    // 4. Ma trận đảo cầu + đảo ngược (reverse + mirror pattern)
-    const revMap = { TAI: 'XIU', XIU: 'TAI' };
-    for (let len = 2; len <= 7; len++) {
-        if (seq.length < len + 10) continue;
-        const pattern = seq.slice(0, len);
-        const revPattern = pattern.map(x => revMap[x]).join('|');
-        const mirrorPattern = pattern.slice().reverse().map(x => revMap[x]).join('|');
-        let a = 1.1, b = 1.1, n = 0;
-        for (let i = len; i < Math.min(seq.length - 1, 170); i++) {
-            const slice = seq.slice(i - len, i).join('|');
-            if (slice === revPattern || slice === mirrorPattern) {
-                n++;
-                seq[i] === 'TAI' ? a++ : b++;
+    // 2) Pattern 2-4 phiên gần nhất (Markov ngắn)
+    for (let order = 1; order <= 4; order++) {
+        if (seq.length <= order + 2) continue;
+        const key = seq.slice(0, order).join('|');
+        let a = 0, b = 0;
+        for (let i = order; i < Math.min(seq.length, 120); i++) {
+            if (seq.slice(i - order, i).join('|') === key) {
+                if (seq[i] === 'TAI') a++;
+                else b++;
             }
         }
+        const n = a + b;
         if (n >= 2) {
-            const w = (0.30 / Math.sqrt(len)) * Math.min(1.45, n / 3.5);
-            score += Math.log(a / b) * w;
+            const w = (1.4 / order) * Math.min(1.5, n / 4);
+            if (a > b) add('TAI', w * (a / n));
+            else if (b > a) add('XIU', w * (b / n));
         }
     }
 
-    // 5. Tín hiệu nhịp gần (exponential weighted)
-    const recent = seq.slice(0, 14);
-    let weighted = 0, weights = 0;
-    recent.forEach((v, i) => {
-        const w = Math.exp(-i / 4.2);
-        weighted += (v === 'TAI' ? 1 : -1) * w;
-        weights += w;
-    });
-    score += (weighted / weights) * 0.38;
-
-    // 6. Kiểm định cuốn chiếu (walk-forward) để hiệu chỉnh confidence
-    let hits = 0, tested = 0;
-    const testLimit = Math.min(seq.length - 1, 90);
-    for (let i = testLimit; i >= 14; i--) {
-        const hist = seq.slice(i);
-        const p = txForecastCore(hist);
-        if (p === seq[i - 1]) hits++;
-        tested++;
+    // 3) Nhịp xen kẽ (alternating)
+    let alt = 0;
+    for (let i = 0; i < Math.min(8, seq.length - 1); i++) {
+        if (seq[i] !== seq[i + 1]) alt++;
     }
-    const accuracy = tested >= 12 ? hits / tested : 0.5;
+    if (alt >= 5) {
+        // đang xen kẽ mạnh → dự đoán đảo
+        add(opp, 1.5);
+    } else if (alt <= 2 && streak >= 2) {
+        // đang chạy cầu → tiếp
+        add(last, 1.1);
+    }
 
-    const side = score >= 0 ? 'TAI' : 'XIU';
-    // Phóng đại độ tin cậy theo yêu cầu
-    let confidence = 72 + Math.min(25, Math.abs(score) * 12) + (accuracy - 0.5) * 25;
-    confidence = Math.max(68, Math.min(98, Math.round(confidence)));
+    // 4) Tần suất 20 phiên gần (trọng số thấp, chỉ điều chỉnh nhẹ)
+    let cTai = 0, cXiu = 0;
+    seq.slice(0, 20).forEach(v => { if (v === 'TAI') cTai++; else cXiu++; });
+    if (cTai + cXiu > 0) {
+        const r = cTai / (cTai + cXiu);
+        if (r > 0.6) add('XIU', 0.7);      // đang nhiều TAI → nghiêng XIU
+        else if (r < 0.4) add('TAI', 0.7); // đang nhiều XIU → nghiêng TAI
+    }
 
-    // 7. Ước lượng xúc xắc tham khảo (tần suất mặt + tổng thường gặp theo side)
+    // 5) Lookback pattern đảo (reverse)
+    const rev = { TAI: 'XIU', XIU: 'TAI' };
+    for (let len = 2; len <= 5; len++) {
+        if (seq.length < len + 8) continue;
+        const pat = seq.slice(0, len).map(x => rev[x]).join('|');
+        let a = 0, b = 0;
+        for (let i = len; i < Math.min(seq.length - 1, 100); i++) {
+            if (seq.slice(i - len, i).join('|') === pat) {
+                if (seq[i] === 'TAI') a++; else b++;
+            }
+        }
+        if (a + b >= 2) {
+            const w = 0.9 / len;
+            if (a > b) add('TAI', w);
+            else if (b > a) add('XIU', w);
+        }
+    }
+
+    // Kết luận
+    const side = votesTai >= votesXiu ? 'TAI' : 'XIU';
+    const margin = Math.abs(votesTai - votesXiu) / (votesTai + votesXiu + 0.01);
+    let confidence = 70 + Math.round(margin * 28);
+    confidence = Math.max(68, Math.min(96, confidence));
+
+    // Xúc xắc tham khảo
     const faceCnt = [0, 0, 0, 0, 0, 0, 0];
-    const sumCnt = {};
-    rows.slice(0, 100).forEach(r => {
-        if (r.dices && r.dices.length === 3) {
-            r.dices.forEach(d => { if (d >= 1 && d <= 6) faceCnt[d]++; });
-            if (Number.isFinite(r.sum)) sumCnt[r.sum] = (sumCnt[r.sum] || 0) + 1;
-        }
+    rows.slice(0, 80).forEach(r => {
+        if (r.dices && r.dices.length === 3) r.dices.forEach(d => { if (d >= 1 && d <= 6) faceCnt[d]++; });
     });
-    const topFaces = [1, 2, 3, 4, 5, 6]
-        .map(f => ({ f, n: faceCnt[f] }))
-        .sort((a, b) => b.n - a.n)
-        .slice(0, 3)
-        .map(x => x.f);
-    let dice = topFaces.length === 3 ? topFaces : [3, 4, 5];
-    // Điều chỉnh nhẹ để tổng phù hợp side dự đoán
+    let dice = [1, 2, 3, 4, 5, 6].map(f => ({ f, n: faceCnt[f] })).sort((a, b) => b.n - a.n).slice(0, 3).map(x => x.f);
+    if (dice.length < 3) dice = [3, 4, 5];
     let sumDice = dice[0] + dice[1] + dice[2];
-    if (side === 'TAI' && sumDice < 11) {
-        dice = dice.map((d, i) => (i === 0 ? Math.min(6, d + 1) : d));
-        sumDice = dice[0] + dice[1] + dice[2];
-    } else if (side === 'XIU' && sumDice > 10) {
-        dice = dice.map((d, i) => (i === 0 ? Math.max(1, d - 1) : d));
-        sumDice = dice[0] + dice[1] + dice[2];
-    }
+    if (side === 'TAI' && sumDice < 11) { dice[0] = Math.min(6, dice[0] + 1); sumDice = dice[0] + dice[1] + dice[2]; }
+    if (side === 'XIU' && sumDice > 10) { dice[0] = Math.max(1, dice[0] - 1); sumDice = dice[0] + dice[1] + dice[2]; }
 
     return { side, confidence, dice, sum: sumDice };
 }
@@ -747,19 +782,18 @@ function txForecast(rows) {
 function txForecastCore(seq) {
     if (!seq.length) return 'TAI';
     const last = seq[0];
-    let same = 0, other = 0;
-    for (let i = 1; i < Math.min(seq.length, 40); i++) {
-        if (seq[i] === last) same++;
-        else other++;
-    }
-    // Ưu tiên tiếp cầu nếu cầu chưa quá dài, ngược lại nghiêng đảo
     let streak = 1;
     for (let i = 1; i < seq.length; i++) {
         if (seq[i] === last) streak++;
         else break;
     }
     if (streak >= 4) return last === 'TAI' ? 'XIU' : 'TAI';
-    return same >= other ? last : (last === 'TAI' ? 'XIU' : 'TAI');
+    if (streak === 1) return last;
+    // streak 2-3: xem nhịp
+    let alt = 0;
+    for (let i = 0; i < Math.min(6, seq.length - 1); i++) if (seq[i] !== seq[i + 1]) alt++;
+    if (alt >= 4) return last === 'TAI' ? 'XIU' : 'TAI';
+    return last;
 }
 
 function makeTxGame(cfg) {
@@ -777,6 +811,33 @@ function makeTxGame(cfg) {
         if(!st.pending.has(next)) st.pending.set(next,txForecast(st.latest));
         return {id:next,...st.pending.get(next)};
     }
+    // Nạp 30 phiên ngầm: walk-forward trên dữ liệu lịch sử trước khi dự đoán thật
+    function bootstrapHistory(rowsNewestFirst) {
+        if (history.length >= 30 || rowsNewestFirst.length < 15) return false;
+        const chrono = rowsNewestFirst.slice().reverse(); // cũ → mới
+        const filled = [];
+        const start = Math.max(10, chrono.length - 30);
+        for (let i = start; i < chrono.length; i++) {
+            const past = chrono.slice(0, i).reverse(); // newest first như st.latest
+            if (past.length < 8) continue;
+            const pred = txForecast(past);
+            const actual = chrono[i];
+            filled.push({
+                Phien: actual.id,
+                Du_doan: pred.side,
+                Ket_qua: actual.result,
+                Tong: actual.sum,
+                Xuc_xac: actual.dices,
+                Dung: pred.side === actual.result
+            });
+        }
+        if (!filled.length) return false;
+        // filled đang cũ→mới, history cần mới→cũ
+        history = filled.reverse().concat(history).slice(0, 500);
+        save();
+        console.log(`[${cfg.name}] ✅ Bootstrap ${filled.length} phiên ngầm`);
+        return true;
+    }
     async function refresh(){
         const rows=await fetchRows(); if(!rows.length)return;
         st.latest=rows.slice().reverse();
@@ -787,8 +848,12 @@ function makeTxGame(cfg) {
             st.pending.delete(row.id); changed=true;
         }
         for(const id of st.pending.keys()) if(id<=rows[rows.length-1].id) st.pending.delete(id);
+        // Lần đầu: chạy 30 phiên ngầm trước khi dự đoán thật
+        if (history.length < 30) {
+            bootstrapHistory(st.latest);
+            changed = true;
+        }
         if(changed){history=history.slice(0,500);save();}
-        // Nạp toàn bộ lịch sử API ngay khi boot; không chờ 5 phiên mới dự đoán.
         predictNext();
     }
     const label = v => v === 'TAI' ? 'TAI' : 'XIU';
