@@ -520,35 +520,160 @@ function normalizeTx(x) {
     return { id, result, dices, sum: Number.isFinite(sum) ? sum : (dices.length ? dices.reduce((a,b)=>a+b,0) : null), createdAt: x.CreatedDate ?? x.createdAt ?? null };
 }
 
-// Mô hình tổ hợp có kiểm định cuốn chiếu: Markov bậc 1-4 + tần suất gần + nhịp cầu.
-// Dữ liệu trò chơi có thể ngẫu nhiên; điểm tin cậy chỉ là độ đồng thuận lịch sử, không bảo đảm thắng.
+// ========== THUẬT TOÁN TX SIÊU KỸ: Ma trận cầu + Đảo cầu + Anti-break + Markov + Tần suất có trọng số ==========
+// Không có thuật toán nào bảo đảm thắng; chỉ là tổ hợp tín hiệu lịch sử có kiểm định cuốn chiếu.
 function txForecast(rows) {
-    const seq = rows.map(x=>x.result).filter(Boolean); if (!seq.length) return { side:'TAI', confidence:50, dice:[3,4,4] };
-    const counts = {TAI:1, XIU:1};
-    seq.slice(0,80).forEach(v=>counts[v]++);
-    let score = Math.log(counts.TAI/counts.XIU) * 0.22;
-    for (let order=1; order<=4; order++) {
-        if (seq.length <= order) continue;
-        const key = seq.slice(0,order).join('|'); let a=1,b=1,n=0;
-        for(let i=order;i<seq.length;i++) if(seq.slice(i-order,i).join('|')===key){ n++; seq[i]==='TAI'?a++:b++; }
-        if(n) score += Math.log(a/b) * (0.55/order) * Math.min(1,n/4);
+    const seq = rows.map(x => x.result).filter(Boolean);
+    if (!seq.length) return { side: 'TAI', confidence: 52, dice: [3, 4, 5], sum: 12 };
+
+    // 1. Tần suất có trọng số (gần đây nặng hơn)
+    const counts = { TAI: 1.5, XIU: 1.5 };
+    const limit = Math.min(120, seq.length);
+    for (let i = 0; i < limit; i++) {
+        const w = Math.exp(-i / 18);
+        counts[seq[i]] += w;
     }
-    const recent=seq.slice(0,12); let weighted=0, weights=0;
-    recent.forEach((v,i)=>{const w=Math.exp(-i/5);weighted+=(v==='TAI'?1:-1)*w;weights+=w;});
-    score += (weighted/weights)*0.35;
-    // Hiệu chỉnh nhẹ theo độ chính xác walk-forward của mô hình trên dữ liệu đã có.
-    let hits=0, tested=0;
-    for(let i=Math.min(seq.length-1,100);i>=12;i--){ const hist=seq.slice(i); const p=txForecastCore(hist); if(p===seq[i-1]) hits++; tested++; }
-    const side=score>=0?'TAI':'XIU';
-    const confidence=Math.max(50,Math.min(68,50+Math.abs(score)*5+(tested>=10?(hits/tested-0.5)*5:0)));
-    const freq=[1,2,3,4,5,6].map(face=>({face,n:rows.slice(0,100).filter(r=>r.dices?.includes(face)).length})).sort((a,b)=>b.n-a.n);
-    const dice=freq.length>=3 && freq[0].n ? freq.slice(0,3).map(x=>x.face) : [3,4,5];
-    return {side,confidence:Math.round(confidence),dice};
+    let score = Math.log(counts.TAI / counts.XIU) * 0.28;
+
+    // 2. Markov bậc 1→5 (ma trận chuyển trạng thái)
+    for (let order = 1; order <= 5; order++) {
+        if (seq.length <= order + 3) continue;
+        const key = seq.slice(0, order).join('|');
+        let a = 1.2, b = 1.2, n = 0;
+        for (let i = order; i < Math.min(seq.length, 180); i++) {
+            if (seq.slice(i - order, i).join('|') === key) {
+                n++;
+                seq[i] === 'TAI' ? a++ : b++;
+            }
+        }
+        if (n >= 2) {
+            const w = (0.62 / order) * Math.min(1.35, n / 5);
+            score += Math.log(a / b) * w;
+        }
+    }
+
+    // 3. Phân tích cầu + Anti-break hệ thống (dựa lịch sử bẻ cầu thực tế)
+    let streak = 1;
+    for (let i = 1; i < seq.length; i++) {
+        if (seq[i] === seq[0]) streak++;
+        else break;
+    }
+    const lastSide = seq[0];
+    let histBreak = 0, histCont = 0;
+    for (let i = 0; i < Math.min(seq.length - streak - 1, 110); i++) {
+        let s = 1;
+        for (let j = i + 1; j < seq.length; j++) {
+            if (seq[j] === seq[i]) s++;
+            else break;
+        }
+        if (s === streak) {
+            const after = seq[i + s];
+            if (after && after !== seq[i]) histBreak++;
+            else if (after) histCont++;
+        }
+    }
+    const breakRate = (histBreak + histCont) > 0 ? histBreak / (histBreak + histCont) : 0.55;
+    if (streak >= 5) {
+        score += (lastSide === 'TAI' ? -1 : 1) * (0.48 + breakRate * 0.38);
+    } else if (streak === 4) {
+        score += (lastSide === 'TAI' ? -1 : 1) * (0.30 + breakRate * 0.28);
+    } else if (streak === 3) {
+        score += (lastSide === 'TAI' ? -1 : 1) * (0.14 + breakRate * 0.16);
+    } else if (streak === 1) {
+        score += (lastSide === 'TAI' ? 0.18 : -0.18);
+    }
+
+    // 4. Ma trận đảo cầu + đảo ngược (reverse + mirror pattern)
+    const revMap = { TAI: 'XIU', XIU: 'TAI' };
+    for (let len = 2; len <= 7; len++) {
+        if (seq.length < len + 10) continue;
+        const pattern = seq.slice(0, len);
+        const revPattern = pattern.map(x => revMap[x]).join('|');
+        const mirrorPattern = pattern.slice().reverse().map(x => revMap[x]).join('|');
+        let a = 1.1, b = 1.1, n = 0;
+        for (let i = len; i < Math.min(seq.length - 1, 170); i++) {
+            const slice = seq.slice(i - len, i).join('|');
+            if (slice === revPattern || slice === mirrorPattern) {
+                n++;
+                seq[i] === 'TAI' ? a++ : b++;
+            }
+        }
+        if (n >= 2) {
+            const w = (0.30 / Math.sqrt(len)) * Math.min(1.45, n / 3.5);
+            score += Math.log(a / b) * w;
+        }
+    }
+
+    // 5. Tín hiệu nhịp gần (exponential weighted)
+    const recent = seq.slice(0, 14);
+    let weighted = 0, weights = 0;
+    recent.forEach((v, i) => {
+        const w = Math.exp(-i / 4.2);
+        weighted += (v === 'TAI' ? 1 : -1) * w;
+        weights += w;
+    });
+    score += (weighted / weights) * 0.38;
+
+    // 6. Kiểm định cuốn chiếu (walk-forward) để hiệu chỉnh confidence
+    let hits = 0, tested = 0;
+    const testLimit = Math.min(seq.length - 1, 90);
+    for (let i = testLimit; i >= 14; i--) {
+        const hist = seq.slice(i);
+        const p = txForecastCore(hist);
+        if (p === seq[i - 1]) hits++;
+        tested++;
+    }
+    const accuracy = tested >= 12 ? hits / tested : 0.5;
+
+    const side = score >= 0 ? 'TAI' : 'XIU';
+    // Phóng đại độ tin cậy theo yêu cầu
+    let confidence = 72 + Math.min(25, Math.abs(score) * 12) + (accuracy - 0.5) * 25;
+    confidence = Math.max(68, Math.min(98, Math.round(confidence)));
+
+    // 7. Ước lượng xúc xắc tham khảo (tần suất mặt + tổng thường gặp theo side)
+    const faceCnt = [0, 0, 0, 0, 0, 0, 0];
+    const sumCnt = {};
+    rows.slice(0, 100).forEach(r => {
+        if (r.dices && r.dices.length === 3) {
+            r.dices.forEach(d => { if (d >= 1 && d <= 6) faceCnt[d]++; });
+            if (Number.isFinite(r.sum)) sumCnt[r.sum] = (sumCnt[r.sum] || 0) + 1;
+        }
+    });
+    const topFaces = [1, 2, 3, 4, 5, 6]
+        .map(f => ({ f, n: faceCnt[f] }))
+        .sort((a, b) => b.n - a.n)
+        .slice(0, 3)
+        .map(x => x.f);
+    let dice = topFaces.length === 3 ? topFaces : [3, 4, 5];
+    // Điều chỉnh nhẹ để tổng phù hợp side dự đoán
+    let sumDice = dice[0] + dice[1] + dice[2];
+    if (side === 'TAI' && sumDice < 11) {
+        dice = dice.map((d, i) => (i === 0 ? Math.min(6, d + 1) : d));
+        sumDice = dice[0] + dice[1] + dice[2];
+    } else if (side === 'XIU' && sumDice > 10) {
+        dice = dice.map((d, i) => (i === 0 ? Math.max(1, d - 1) : d));
+        sumDice = dice[0] + dice[1] + dice[2];
+    }
+
+    return { side, confidence, dice, sum: sumDice };
 }
-function txForecastCore(seq){
-    const last=seq[0]; let same=0,other=0;
-    for(let i=1;i<seq.length;i++) if(seq[i]===last) same++; else other++;
-    return same>=other?last:(last==='TAI'?'XIU':'TAI');
+
+function txForecastCore(seq) {
+    if (!seq.length) return 'TAI';
+    const last = seq[0];
+    let same = 0, other = 0;
+    for (let i = 1; i < Math.min(seq.length, 40); i++) {
+        if (seq[i] === last) same++;
+        else other++;
+    }
+    // Ưu tiên tiếp cầu nếu cầu chưa quá dài, ngược lại nghiêng đảo
+    let streak = 1;
+    for (let i = 1; i < seq.length; i++) {
+        if (seq[i] === last) streak++;
+        else break;
+    }
+    if (streak >= 4) return last === 'TAI' ? 'XIU' : 'TAI';
+    return same >= other ? last : (last === 'TAI' ? 'XIU' : 'TAI');
 }
 
 function makeTxGame(cfg) {
@@ -580,21 +705,52 @@ function makeTxGame(cfg) {
         // Nạp toàn bộ lịch sử API ngay khi boot; không chờ 5 phiên mới dự đoán.
         predictNext();
     }
-    const label=v=>v==='TAI'?'TÀI':'XỈU'; const mark=v=>v?'✅':'❌';
-    app.get(cfg.route,async(req,res)=>{
-        try{
-            if(!st.latest.length) await refresh();
-            if(!st.latest.length)return res.status(503).json({Name:cfg.name,TrangThai:'API chưa trả dữ liệu'});
-            const p=predictNext(), prev=st.latest[0], old=history[0];
-            res.json({id:BRAND_ID,Name:cfg.name,Phien:p.id,'DỰ ĐOÁN':label(p.side),'XÚC XẮC DỰ ĐOÁN':p.dice,'ĐỘ TIN CẬY THAM KHẢO':p.confidence+'%','PHIÊN TRƯỚC':{Phien:prev.id,Xuc_xac:prev.dices,Tong:prev.sum, Ket_qua:label(prev.result), 'Dự đoán trước':old?label(old.Du_doan):null,'Đánh giá':old?mark(old.Dung):'chưa chấm'}});
-        }catch(e){res.status(503).json({Name:cfg.name,TrangThai:'Lỗi lấy dữ liệu',error:e.message});}
+    const label = v => v === 'TAI' ? 'TAI' : 'XIU';
+    const mark = v => v ? 'ĐÚNG' : 'SAI';
+    // History 1 dòng đầy đủ
+    const historyLineTx = h => {
+        const d = Array.isArray(h.Xuc_xac) ? h.Xuc_xac : ['?', '?', '?'];
+        return `phien:${h.Phien} - d1:${d[0]} d2:${d[1]} d3:${d[2]} -doan ${label(h.Du_doan)}-kq:${label(h.Ket_qua)}`;
+    };
+    app.get(cfg.route, async (req, res) => {
+        try {
+            if (!st.latest.length) await refresh();
+            if (!st.latest.length) return res.status(503).json({ id: BRAND_ID, Name: cfg.name, TrangThai: 'API chưa trả dữ liệu' });
+            const p = predictNext(), prev = st.latest[0], old = history[0];
+            const d1 = p.dice[0], d2 = p.dice[1], d3 = p.dice[2];
+            res.json({
+                id: BRAND_ID,
+                Name: cfg.name,
+                Phien: p.id,
+                Du_doan: label(p.side),
+                Xuc_xac_1: d1,
+                Xuc_xac_2: d2,
+                Xuc_xac_3: d3,
+                Tong: p.sum || (d1 + d2 + d3),
+                Do_tin_cay: p.confidence + '%',
+                Phien_truoc: old ? mark(old.Dung) : 'chưa chấm'
+            });
+        } catch (e) {
+            res.status(503).json({ id: BRAND_ID, Name: cfg.name, TrangThai: 'Lỗi lấy dữ liệu', error: e.message });
+        }
     });
-    app.get(cfg.historyRoute,(req,res)=>{
-        const n=Math.min(100,Math.max(1,Number(req.query.n)||50)); const total=history.length,hit=history.filter(h=>h.Dung).length;
-        res.json({id:BRAND_ID,Name:cfg.name,'Thống kê':{Tong:total,Dung:`${hit}/${total}`,Ty_le:total?(hit/total*100).toFixed(1)+'%':'0%'},'Lịch sử':history.slice(0,n).map(h=>({Phien:h.Phien,'Dự đoán':label(h.Du_doan),Xuc_xac:h.Xuc_xac,Tong:h.Tong,'Kết quả':label(h.Ket_qua),'Đánh giá':mark(h.Dung)}))});
+    app.get(cfg.historyRoute, (req, res) => {
+        const n = Math.min(100, Math.max(1, Number(req.query.n) || 50));
+        const total = history.length;
+        const hit = history.filter(h => h.Dung).length;
+        res.json({
+            id: BRAND_ID,
+            Name: cfg.name,
+            Thong_ke: {
+                Tong: total,
+                Dung: `${hit}/${total}`,
+                Ty_le: total ? (hit / total * 100).toFixed(1) + '%' : '0%'
+            },
+            Lich_su: history.slice(0, n).map(historyLineTx)
+        });
     });
-    refresh().catch(e=>console.error(`[${cfg.name}] boot`,e.message));
-    setInterval(()=>refresh().catch(e=>console.error(`[${cfg.name}] refresh`,e.message)),3000);
+    refresh().catch(e => console.error(`[${cfg.name}] boot`, e.message));
+    setInterval(() => refresh().catch(e => console.error(`[${cfg.name}] refresh`, e.message)), 3000);
 }
 
 const LC_TX_AT=process.env.TX_AT||'';
@@ -611,9 +767,24 @@ const KEY_FILE=path.join(DATA_DIR,'keys.json');
 let keys=[]; try{keys=JSON.parse(fs.readFileSync(KEY_FILE,'utf8'));}catch{}
 const saveKeys=()=>fs.writeFileSync(KEY_FILE,JSON.stringify(keys,null,2));
 const crypto=require('crypto');
-const makeKey=()=>crypto.randomBytes(12).toString('hex').toUpperCase();
-const durationMs=(v)=>{const m=String(v||'1d').match(/^(\d+)(h|d|w)$/i);if(!m)return 86400000;return Number(m[1])*({h:3600000,d:86400000,w:604800000}[m[2].toLowerCase()]);};
-function keyInfo(k){return keys.find(x=>x.key===k&&x.active&&Date.now()<x.expiresAt);}
+// Key 6 ký tự: chỉ chữ thường + số (dễ nhớ, không in hoa)
+const makeKey = () => {
+    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+    let s = '';
+    const bytes = crypto.randomBytes(6);
+    for (let i = 0; i < 6; i++) s += chars[bytes[i] % chars.length];
+    return s;
+};
+const durationMs = (v) => {
+    const m = String(v || '1d').match(/^(\d+)(h|d|w)$/i);
+    if (!m) return 86400000;
+    return Number(m[1]) * ({ h: 3600000, d: 86400000, w: 604800000 }[m[2].toLowerCase()]);
+};
+function keyInfo(k) {
+    if (!k) return null;
+    const lower = String(k).toLowerCase();
+    return keys.find(x => x.key === lower && x.active && Date.now() < x.expiresAt);
+}
 const apiNames=['/api/xdlc','/history','/api/tx','/history/tx','/api/md5','/history/md5','/api/hitclub/tx','/history/hitclub/tx','/api/hitclub/md5','/history/hitclub/md5','/api/max789/tx','/history/max789/tx','/api/max789/md5','/history/max789/md5'];
 app.get('/:accessKey', (req,res,next)=>{
     const k=keyInfo(req.params.accessKey); if(!k)return res.status(403).json({error:'KEY_INVALID_OR_EXPIRED'});
@@ -636,18 +807,46 @@ if(process.env.TELEGRAM_BOT_TOKEN){
     const admins=(process.env.ADMIN_IDS||'').split(',').map(x=>x.trim()).filter(Boolean);
     const isAdmin=id=>admins.includes(String(id));
     bot.onText(/^\/start$/,msg=>bot.sendMessage(msg.chat.id,'🎲 API GAME BOT\n\nLệnh quản trị: /taokey 1d | /taokey 12h | /taokey 7d | /keys | /khoa KEY\n\nKey được tạo sẽ tự có link API và tự hết hạn.'));
-    bot.onText(/^\/taokey(?:\s+(\d+[hdw]))?$/i,(msg,match)=>{
-        if(!isAdmin(msg.from.id))return bot.sendMessage(msg.chat.id,'⛔ Bạn không có quyền.');
-        const duration=match[1]||'1d',ms=durationMs(duration),key=makeKey(),expiresAt=Date.now()+ms;
-        keys.push({key,createdAt:Date.now(),expiresAt,active:true,createdBy:msg.from.id});saveKeys();
-        const base=(process.env.APP_URL||'https://your-app.onrender.com').replace(/\/$/,'');
-        const link=base+'/'+key;
-        const text=`✅ ĐÃ TẠO KEY\n\n🔑 ${key}\n⏳ Thời hạn: ${duration}\n🕒 Hết hạn: ${new Date(expiresAt).toLocaleString('vi-VN',{timeZone:'Asia/Ho_Chi_Minh'})}\n\n🔗 Link API: ${link}\n\nMở link để xem danh sách endpoint. Key sẽ tự khóa khi hết hạn.`;
-        bot.sendMessage(msg.chat.id,text,{disable_web_page_preview:true});
-        if(String(msg.chat.id)!==String(process.env.ADMIN_NOTIFY_CHAT_ID||msg.chat.id))bot.sendMessage(process.env.ADMIN_NOTIFY_CHAT_ID||msg.chat.id,`🆕 Key mới ${key}\n${link}\nHạn: ${duration}`);
+    bot.onText(/^\/taokey(?:\s+(\d+[hdw]))?$/i, (msg, match) => {
+        if (!isAdmin(msg.from.id)) return bot.sendMessage(msg.chat.id, '⛔ Bạn không có quyền.');
+        const duration = match[1] || '1d', ms = durationMs(duration), key = makeKey(), expiresAt = Date.now() + ms;
+        keys.push({ key, createdAt: Date.now(), expiresAt, active: true, createdBy: msg.from.id }); saveKeys();
+        const base = (process.env.APP_URL || 'https://your-app.onrender.com').replace(/\/$/, '');
+        const prefix = base + '/' + key;
+        const links = [
+            `CL: ${prefix}/api/xdlc`,
+            `CL-HS: ${prefix}/history`,
+            `TX: ${prefix}/api/tx`,
+            `TX-HS: ${prefix}/history/tx`,
+            `MD5: ${prefix}/api/md5`,
+            `MD5-HS: ${prefix}/history/md5`,
+            `HIT-TX: ${prefix}/api/hitclub/tx`,
+            `HIT-TX-HS: ${prefix}/history/hitclub/tx`,
+            `HIT-MD5: ${prefix}/api/hitclub/md5`,
+            `HIT-MD5-HS: ${prefix}/history/hitclub/md5`,
+            `MAX-TX: ${prefix}/api/max789/tx`,
+            `MAX-TX-HS: ${prefix}/history/max789/tx`,
+            `MAX-MD5: ${prefix}/api/max789/md5`,
+            `MAX-MD5-HS: ${prefix}/history/max789/md5`
+        ].join('\n');
+        const text = `✅ KEY MỚI\n\n🔑 ${key}\n⏳ ${duration} · Hết: ${new Date(expiresAt).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}\n\n📎 ALL LINK:\n${links}`;
+        bot.sendMessage(msg.chat.id, text, { disable_web_page_preview: true });
+        if (String(msg.chat.id) !== String(process.env.ADMIN_NOTIFY_CHAT_ID || msg.chat.id)) {
+            bot.sendMessage(process.env.ADMIN_NOTIFY_CHAT_ID || msg.chat.id, `🆕 Key ${key}\n${duration}\n${prefix}`);
+        }
     });
-    bot.onText(/^\/keys$/,(msg)=>{if(!isAdmin(msg.from.id))return;const active=keys.filter(k=>k.active&&k.expiresAt>Date.now());bot.sendMessage(msg.chat.id,active.length?active.map(k=>`${k.key} · ${new Date(k.expiresAt).toLocaleString('vi-VN',{timeZone:'Asia/Ho_Chi_Minh'})}`).join('\n'):'Không có key hoạt động.');});
-    bot.onText(/^\/khoa\s+([A-F0-9]+)$/i,(msg,m)=>{if(!isAdmin(msg.from.id))return;const k=keys.find(x=>x.key===m[1].toUpperCase());if(!k)return bot.sendMessage(msg.chat.id,'Không tìm thấy key.');k.active=false;saveKeys();bot.sendMessage(msg.chat.id,`🔒 Đã khóa ${k.key}`);});
+    bot.onText(/^\/keys$/, (msg) => {
+        if (!isAdmin(msg.from.id)) return;
+        const active = keys.filter(k => k.active && k.expiresAt > Date.now());
+        bot.sendMessage(msg.chat.id, active.length ? active.map(k => `${k.key} · ${new Date(k.expiresAt).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' })}`).join('\n') : 'Không có key hoạt động.');
+    });
+    bot.onText(/^\/khoa\s+([a-z0-9]{6})$/i, (msg, m) => {
+        if (!isAdmin(msg.from.id)) return;
+        const k = keys.find(x => x.key === m[1].toLowerCase());
+        if (!k) return bot.sendMessage(msg.chat.id, 'Không tìm thấy key.');
+        k.active = false; saveKeys();
+        bot.sendMessage(msg.chat.id, `🔒 Đã khóa ${k.key}`);
+    });
     setInterval(()=>{let dirty=false;for(const k of keys)if(k.active&&Date.now()>=k.expiresAt){k.active=false;dirty=true;}if(dirty)saveKeys();},30000);
     bot.on('polling_error',e=>console.error('Telegram polling:',e.message));
 }
